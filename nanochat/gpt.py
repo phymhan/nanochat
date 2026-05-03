@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    no_x0_resid: bool = False  # disable x0_lambdas (no embedding blending) and resid scaling
+    no_ve: bool = False        # disable value embeddings
 
 
 def norm(x):
@@ -77,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (has_ve(layer_idx, config.n_layer) and not config.no_ve) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -197,6 +199,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Reg warmup factor as a buffer (0-d tensor) so torch.compile doesn't
+        # specialize on it.  Updated externally by the training loop each step.
+        self.register_buffer("reg_warmup_factor", torch.ones(1), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -380,6 +385,14 @@ class GPT(nn.Module):
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
+        # When no_ve/no_x0_resid: these params exist but aren't used in forward,
+        # so they get no gradient. Exclude from optimizer to avoid None grad errors.
+        if self.config.no_ve:
+            value_embeds_params = []
+        if self.config.no_x0_resid:
+            resid_params = []
+            x0_params = []
+
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -408,7 +421,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', jacobi_reg=0.0, identity_newton_reg=0.0, diag_newton_reg=0.0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -448,12 +461,143 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        jacobi_reg_loss = 0.0  # accumulate contractive regularization
+        all_h = []  # save per-layer outputs for identity Newton reg
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if self.config.no_x0_resid:
+                pass  # pure residual: x unchanged (standard transformer)
+            else:
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = None if self.config.no_ve else (self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None)
+            x_pre = x  # save pre-block input for regularization
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if jacobi_reg > 0:
+                # Contractive regularization: penalize the Jacobian spectral radius.
+                # Estimate σ_max(∂block/∂input) via finite-difference power iteration:
+                #   σ_max ≈ ||block(x + εv) - block(x)|| / (ε||v||)
+                # Then penalize ||block(x) - x||² scaled by max(0, σ_max - target)
+                # so that the gradient flows through the MAIN forward path.
+                eps_fd = 1e-2
+                v = torch.randn_like(x_pre)
+                v = v / (v.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+                with torch.no_grad():
+                    x_pert = block(x_pre + eps_fd * v, ve, cos_sin, self.window_sizes[i], kv_cache)
+                    x_unpert = block(x_pre, ve, cos_sin, self.window_sizes[i], kv_cache)
+                    Jv_approx = (x_pert - x_unpert) / eps_fd
+                    sigma_est = Jv_approx.float().norm(dim=-1).mean().item()
+                # The FD estimate is no-grad (just for measuring), but we penalize
+                # the actual residual norm of the block in the forward path, weighted
+                # by how much the spectral radius exceeds 1.
+                if sigma_est > 0.9:  # only penalize if spectral radius is near/above 1
+                    residual = x - x_pre
+                    reg_i = (residual.float().norm(dim=-1) / (x_pre.float().norm(dim=-1) + 1e-6)).mean()
+                    weight = min(sigma_est, 3.0)  # stronger penalty for larger spectral radius
+                    jacobi_reg_loss = jacobi_reg_loss + weight * reg_i
+            all_h.append(x)
             if i == backout_layer:
                 x_backout = x
+        # Identity Newton regularization: penalize the gap between sequential output
+        # and what identity Newton K=1 would produce, for the last few layers.
+        # This trains the model so that running the last N layers in parallel (with
+        # one Newton correction using J≈I) gives output close to sequential.
+        # n_par configs for identity/diagonal Newton regularization.
+        # Set self.n_par_configs before torch.compile (fixed for the entire run).
+        # Default: [3, 5, 7, 10, 12, 16] clamped to valid range.
+        n_par_configs = getattr(self, 'n_par_configs', None)
+        if n_par_configs is None:
+            n_par_configs = [3, 5, min(7, n_layer-1), min(10, n_layer-1), min(12, n_layer-1), min(16, n_layer-2)]
+
+        # Identity Newton regularization: penalize the gap between sequential output
+        # and what identity Newton K=1 would produce for the last N layers.
+        # Trains layers to be input-invariant (J ≈ I).
+        identity_newton_loss = 0.0
+        if identity_newton_reg > 0 and targets is not None:
+            for n_par in n_par_configs:
+                seq_layers = n_layer - n_par
+                h_init = all_h[seq_layers - 1] if seq_layers > 0 else x0
+                # NOTE: only the last layer's output is used in the loss.
+                # Intermediate h_newton[0..N-2] are computed but not read —
+                # for identity Newton, input-invariance of the last layer is
+                # sufficient.  For diagonal Newton (below) all layers matter.
+                li = n_layer - 1
+                if self.config.no_x0_resid:
+                    x_in_last = h_init
+                else:
+                    x_in_last = self.resid_lambdas[li] * h_init + self.x0_lambdas[li] * x0
+                ve_last = None if self.config.no_ve else (self.value_embeds[str(li)](idx).to(x_in_last.dtype) if str(li) in self.value_embeds else None)
+                h_newton_final = self.transformer.h[li](x_in_last, ve_last, cos_sin, self.window_sizes[li], kv_cache)
+                h_seq_final = all_h[n_layer - 1]
+                diff = (h_newton_final.float() - h_seq_final.float()).norm(dim=-1)
+                ref_norm = h_seq_final.float().norm(dim=-1).clamp(min=1e-6)
+                identity_newton_loss = identity_newton_loss + (diff / ref_norm).mean()
+
+        # Diagonal Newton regularization: a weaker alternative to identity Newton.
+        # Uses the actual diagonal of the Jacobian in a forward-substitution
+        # correction.  Weaker constraint → less base PPL degradation.
+        #
+        # Config attributes (set on model before torch.compile):
+        #   self.diag_newton_jvp: 'fd' | 'vjp'  — how to estimate diag(J)
+        #     fd:  finite-difference Hutchinson (1 extra no-grad forward / layer)
+        #     vjp: backward-mode AD Hutchinson (1 forward + 1 backward / layer)
+        #     NOTE: forward-mode AD (jvp) unavailable — FA3/SDPA lack JVP rules.
+        #   self.diag_stride: int — estimate diag(J) every N layers, use J≈I for
+        #     the rest. Reduces FD/VJP cost from n_par to n_par/stride evaluations.
+        #     Static condition (j % stride == 0) → torch.compile friendly.
+        diag_newton_loss = 0.0
+        if diag_newton_reg > 0 and targets is not None:
+            jvp_method = getattr(self, 'diag_newton_jvp', 'fd')
+            diag_stride = getattr(self, 'diag_stride', 1)
+            fd_eps = 1e-2
+            for n_par in n_par_configs:
+                seq_layers = n_layer - n_par
+                h_init = all_h[seq_layers - 1] if seq_layers > 0 else x0
+                # Rademacher vector for Hutchinson diagonal estimation (shared across layers)
+                z = torch.randint(0, 2, h_init.shape, device=h_init.device, dtype=h_init.dtype) * 2 - 1
+                h_newton = []
+                diags = []
+                for j in range(n_par):
+                    li = seq_layers + j
+                    x_in = h_init if self.config.no_x0_resid else (self.resid_lambdas[li] * h_init + self.x0_lambdas[li] * x0)
+                    ve_j = None if self.config.no_ve else (self.value_embeds[str(li)](idx).to(x_in.dtype) if str(li) in self.value_embeds else None)
+                    # Estimate diag(J) only every diag_stride layers (static condition
+                    # for torch.compile). Skipped layers use J≈I (identity Newton).
+                    estimate_diag = (diag_stride <= 1 or j % diag_stride == 0)
+                    if estimate_diag and jvp_method == 'vjp':
+                        with torch.enable_grad():
+                            h_init_g = h_init.detach().requires_grad_(True)
+                            x_in_g = h_init_g if self.config.no_x0_resid else (self.resid_lambdas[li] * h_init_g + self.x0_lambdas[li] * x0.detach())
+                            h_j_g = self.transformer.h[li](x_in_g, ve_j, cos_sin, self.window_sizes[li], kv_cache)
+                            vjp_z = torch.autograd.grad(h_j_g, h_init_g, grad_outputs=z, retain_graph=False)[0]
+                        diags.append((z * vjp_z).detach())
+                        h_j = self.transformer.h[li](x_in, ve_j, cos_sin, self.window_sizes[li], kv_cache)
+                    elif estimate_diag:  # 'fd'
+                        h_j = self.transformer.h[li](x_in, ve_j, cos_sin, self.window_sizes[li], kv_cache)
+                        x_in_pert = (h_init + fd_eps * z) if self.config.no_x0_resid else (self.resid_lambdas[li] * (h_init + fd_eps * z) + self.x0_lambdas[li] * x0)
+                        with torch.no_grad():
+                            h_j_pert = self.transformer.h[li](x_in_pert, ve_j, cos_sin, self.window_sizes[li], kv_cache)
+                            diag_j = z * (h_j_pert.float() - h_j.float().detach()) / fd_eps
+                            diag_j = diag_j.clamp(-2, 2)
+                        diags.append(diag_j.to(h_j.dtype).detach())
+                    else:
+                        # Skip diag estimation: use identity (J≈I)
+                        h_j = self.transformer.h[li](x_in, ve_j, cos_sin, self.window_sizes[li], kv_cache)
+                        diags.append(None)  # sentinel for identity
+                    h_newton.append(h_j)
+                # Diagonal Newton K=1 correction via forward substitution:
+                #   h_corr[0] = f_0(h_init)  (first layer input is correct)
+                #   h_corr[j] = f_j(h_init) + diag_j * (h_corr[j-1] - h_init)
+                # For layers where diag was skipped (None), use identity: diag_j=1
+                h_corr = h_newton[0]
+                for j in range(1, n_par):
+                    if diags[j] is not None:
+                        h_corr = h_newton[j] + diags[j] * (h_corr - h_init)
+                    else:
+                        h_corr = h_newton[j] + (h_corr - h_init)  # identity Newton
+                h_seq_final = all_h[n_layer - 1].detach()
+                diff = (h_corr.float() - h_seq_final.float()).norm(dim=-1)
+                ref_norm = h_seq_final.float().norm(dim=-1).clamp(min=1e-6)
+                diag_newton_loss = diag_newton_loss + (diff / ref_norm).mean()
+
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
@@ -470,6 +614,16 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # reg_warmup_factor is a registered buffer (0-d tensor) updated externally
+            # each step.  Using a tensor (not a Python float) avoids torch.compile
+            # recompilation when the warmup value changes.
+            warmup = self.reg_warmup_factor
+            if jacobi_reg > 0:
+                loss = loss + warmup * jacobi_reg * jacobi_reg_loss / n_layer
+            if identity_newton_reg > 0:
+                loss = loss + warmup * identity_newton_reg * identity_newton_loss
+            if diag_newton_reg > 0:
+                loss = loss + warmup * diag_newton_reg * diag_newton_loss
             return loss
         else:
             # inference: just return the logits directly

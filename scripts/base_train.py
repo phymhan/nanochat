@@ -68,6 +68,16 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# Jacobi layer-parallel regularization
+parser.add_argument("--jacobi-reg", type=float, default=0.0, help="contractive regularization weight for Jacobi convergence (0 = disabled)")
+parser.add_argument("--jacobi-reg-warmup", type=float, default=0.0, help="fraction of training to warmup jacobi-reg from 0 to target (0 = no warmup)")
+parser.add_argument("--identity-newton-reg", type=float, default=0.0, help="identity Newton K=1 regularization weight (0 = disabled)")
+parser.add_argument("--diag-newton-reg", type=float, default=0.0, help="diagonal Newton K=1 regularization weight (0 = disabled). Weaker than identity Newton: uses diag(J) instead of J≈I")
+parser.add_argument("--diag-newton-jvp", type=str, default="fd", choices=["fd", "vjp"], help="diag estimation method: fd (finite-diff, cheap) or vjp (backward AD, accurate)")
+parser.add_argument("--n-par-configs", type=str, default=None, help="comma-separated n_par values for IDN/diag Newton reg (e.g. '7' or '8,16'). Default: 3,5,7,10,12,16 clamped to depth")
+parser.add_argument("--diag-stride", type=int, default=1, help="estimate diag(J) every N layers in diag Newton reg (1=all, 3=every 3rd). Skipped layers use J≈I. Compile-friendly.")
+parser.add_argument("--spectral-norm", action="store_true", help="apply spectral normalization to all linear layers (hard σ_max=1 constraint)")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (avoids recompilation issues with dynamic reg weights)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -75,6 +85,9 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Architecture ablations
+parser.add_argument("--no-x0-resid", action="store_true", help="disable x0_lambdas and resid scaling (standard transformer residual)")
+parser.add_argument("--no-ve", action="store_true", help="disable value embeddings")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -137,6 +150,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        no_x0_resid=args.no_x0_resid, no_ve=args.no_ve,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -242,8 +256,28 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
+# Apply spectral normalization if requested (before compile)
+if args.spectral_norm:
+    from torch.nn.utils import spectral_norm
+    count = 0
+    for block in model.transformer.h:
+        for name, module in block.named_modules():
+            if isinstance(module, torch.nn.Linear) and module.weight.shape[0] > 1:
+                spectral_norm(module, n_power_iterations=1)
+                count += 1
+    print0(f"Applied spectral normalization to {count} linear layers")
+
+# Set layer-parallel reg config as model attributes (read inside forward, fixed for torch.compile)
+model.diag_newton_jvp = args.diag_newton_jvp
+model.diag_stride = args.diag_stride
+if args.n_par_configs is not None:
+    model.n_par_configs = [int(x) for x in args.n_par_configs.split(',')]
+
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.no_compile:
+    print0("torch.compile disabled (--no-compile)")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -508,7 +542,13 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        # Reg warmup: update the registered buffer (0-d tensor).
+        # Using a tensor buffer avoids torch.compile recompilation vs Python float args.
+        if args.jacobi_reg_warmup > 0:
+            warmup_steps = int(args.jacobi_reg_warmup * num_iterations)
+            orig_model.reg_warmup_factor.fill_(min(1.0, step / max(warmup_steps, 1)))
+        # else: buffer stays at 1.0 (initialized in GPT.__init__)
+        loss = model(x, y, jacobi_reg=args.jacobi_reg, identity_newton_reg=args.identity_newton_reg, diag_newton_reg=args.diag_newton_reg)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
